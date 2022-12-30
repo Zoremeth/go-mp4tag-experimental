@@ -1,2 +1,2 @@
 # go-mp4tag-experimental
-Experimental.
+Experimental with read & write support.
