@@ -1,8 +1,10 @@
 package mp4tag
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	//"fmt"
 	"os"
@@ -27,13 +29,12 @@ var atomsMap = map[string]mp4.BoxType{
 	"Label":          {'\251', 'l', 'a', 'b'},
 	"Title":          {'\251', 'n', 'a', 'm'},
 	"Track":          {'t', 'r', 'k', 'n'},
-	"Year":        	  {'\251', 'd', 'a', 'y'},
+	"Year":           {'\251', 'd', 'a', 'y'},
 	"UnsyncedLyrics": {'\251', 'l', 'y', 'r'},
-	"ItunesAdvisory": {'r', 't', 'n', 'g'},
-	"compilation": {'c', 'p', 'i', 'l'},
-	"albumSort": {'s', 'o', 'a', 'l'},
-	"artistSort": {'s', 'o', 'a', 'a'},
-
+	"ContentRating":  {'r', 't', 'n', 'g'},
+	"compilation":    {'c', 'p', 'i', 'l'},
+	"albumSort":      {'s', 'o', 'a', 'l'},
+	"artistSort":     {'s', 'o', 'a', 'a'},
 }
 
 func copy(w *mp4.Writer, h *mp4.ReadHandle) error {
@@ -64,9 +65,6 @@ func populateAtoms(f *os.File, tags *Tags) (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(ilst) == 0 {
-		return nil, errors.New("ilst atom is missing, implement me")
-	}
 	atoms := map[string]bool{}
 	fields := reflect.VisibleFields(reflect.TypeOf(*tags))
 	for _, field := range fields {
@@ -74,6 +72,11 @@ func populateAtoms(f *os.File, tags *Tags) (map[string]bool, error) {
 		if fieldName == "Custom" || fieldName == "TrackTotal" || fieldName == "DiskTotal" {
 			continue
 		}
+
+		if len(ilst) == 0 {
+			atoms[fieldName] = true
+		}
+
 		if fieldName == "TrackNumber" {
 			fieldName = "Track"
 		} else if fieldName == "DiskNumber" {
@@ -89,6 +92,9 @@ func populateAtoms(f *os.File, tags *Tags) (map[string]bool, error) {
 			return nil, err
 		}
 		atoms[fieldName] = len(boxes) == 0
+	}
+	if len(ilst) == 0 {
+		return atoms, errors.New("no ilst atom")
 	}
 	return atoms, nil
 }
@@ -243,6 +249,12 @@ func createAndWrite(h *mp4.ReadHandle, w *mp4.Writer, ctx mp4.Context, tags *Tag
 			return err
 		}
 	}
+	if tags.ContentRating > 0 {
+		err = writeMeta(w, atomsMap["ContentRating"], ctx, []byte{byte(tags.ContentRating)})
+		if err != nil {
+			return err
+		}
+	}
 	if tags.DiskNumber > 0 {
 		disk := make([]byte, 8)
 		binary.BigEndian.PutUint32(disk, uint32(tags.DiskNumber))
@@ -255,7 +267,7 @@ func createAndWrite(h *mp4.ReadHandle, w *mp4.Writer, ctx mp4.Context, tags *Tag
 		}
 	}
 	for tagName, needCreate := range atoms {
-		if tagName == "Cover" || tagName == "Track" || tagName == "Disk" {
+		if tagName == "Cover" || tagName == "Track" || tagName == "Disk" || tagName == "ContentRating" {
 			continue
 		}
 		var val string
@@ -284,9 +296,12 @@ func createAndWrite(h *mp4.ReadHandle, w *mp4.Writer, ctx mp4.Context, tags *Tag
 			return err
 		}
 	}
+
 	_, err = h.Expand()
 	if err != nil {
-		return err
+		// If you write no atoms, you should not expand the box.
+		// Removed return statement to finish writing the file.
+		fmt.Println("could not expand box:", err)
 	}
 	_, err = w.EndBox()
 	return err
@@ -312,7 +327,7 @@ func writeExisting(h *mp4.ReadHandle, w *mp4.Writer, tags *Tags, currentKey stri
 		}
 		data := box.(*mp4.Data)
 		data.DataType = mp4.DataTypeBinary
-		data.Data = []byte(tags.CoversData[0])
+		data.Data = tags.CoversData[0]
 		_, err = mp4.Marshal(w, data, h.BoxInfo.Context)
 		if err != nil {
 			return false, err
@@ -348,6 +363,10 @@ func writeExisting(h *mp4.ReadHandle, w *mp4.Writer, tags *Tags, currentKey stri
 		// 	binary.BigEndian.PutUint16(trkn[4:], uint16(_tags.TrackTotal))
 		// }
 		// // err := writeMeta(w, h.BoxInfo.Type, ctx, trkn)
+	} else if currentKey == "ContentRating" {
+		if !(tags.ContentRating >= 0 && tags.ContentRating <= 2) {
+			return true, nil
+		}
 	} else {
 		var toWrite string
 
@@ -455,18 +474,31 @@ func (mp4File *MP4File) actualWrite(tags *Tags) error {
 		return err
 	}
 	r := bufseekio.NewReadSeeker(mp4File.f, 128*1024, 4)
+	var createIlst bool
 	atoms, err := populateAtoms(mp4File.f, tags)
 	if err != nil {
-		tempFile.Close()
-		return err
+		if err.Error() != "no ilst atom" {
+			tempFile.Close()
+			return err
+		} else {
+			createIlst = true
+		}
 	}
 	w := mp4.NewWriter(tempFile)
 	_, err = mp4.ReadBoxStructure(r, func(h *mp4.ReadHandle) (interface{}, error) {
 		switch h.BoxInfo.Type {
 		case mp4.BoxTypeMoov(), mp4.BoxTypeUdta(), mp4.BoxTypeMeta():
-			err := copy(w, h)
-			return nil, err
+			if !(h.BoxInfo.Type == mp4.BoxTypeMoov() && createIlst) {
+				err := copy(w, h)
+				return nil, err
+			}
+			err = createIlstAndWrite(w, h, tags, atoms)
+			if err != nil {
+				return nil, err
+			}
 		case mp4.BoxTypeIlst():
+			// In case the ilst atom had to be created, we won't encounter the ilst while looping anymore
+			// Hence, we don't check if ilst already exists here.
 			err := createAndWrite(h, w, ctx, tags, atoms)
 			return nil, err
 		case containsAtom(h.BoxInfo.Type, atomsList):
@@ -497,6 +529,7 @@ func (mp4File *MP4File) actualWrite(tags *Tags) error {
 		default:
 			return nil, w.CopyBox(r, &h.BoxInfo)
 		}
+		return nil, nil
 	})
 	tempFile.Close()
 	if err != nil {
@@ -504,4 +537,185 @@ func (mp4File *MP4File) actualWrite(tags *Tags) error {
 	}
 	err = copyTrack(tempPath, mp4File.trackPath)
 	return err
+}
+
+func createIlstAndWrite(w *mp4.Writer, h *mp4.ReadHandle, tags *Tags, atoms map[string]bool) error {
+	//fmt.Println("Creating ilst")
+	_, err := w.StartBox(&h.BoxInfo)
+	if err != nil {
+		return err
+	}
+	// read payload
+	box, _, err := h.ReadPayload()
+	if err != nil {
+		return err
+	}
+
+	// expand children
+	_, err = h.Expand()
+	if err != nil {
+		return err
+	}
+
+	// marshal existing payload (so we append ilst after trak/mvhd)
+	_, err = mp4.Marshal(w, box, h.BoxInfo.Context)
+	if err != nil {
+		return err
+	}
+
+	// Create tree moov > udta > meta > hdlr, ilst > tags
+	_, err = w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeUdta(), Context: h.BoxInfo.Context})
+	if err != nil {
+		return err
+	}
+
+	ctx := mp4.Context{UnderUdta: true}
+
+	_, err = w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeMeta(), Context: ctx})
+	if err != nil {
+		return err
+	}
+
+	// Padding
+	_, err = w.Write(bytes.Repeat([]byte{0x00}, 4))
+	if err != nil {
+		return err
+	}
+
+	// start handler box
+	_, err = w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeHdlr(), Context: ctx})
+
+	mdirBuffer := bytes.Buffer{}
+	mdirBuffer.Write(bytes.Repeat([]byte{0x00}, 8))
+	mdirBuffer.WriteString("mdirappl")
+	mdirBuffer.Write(bytes.Repeat([]byte{0x00}, 10))
+	_, err = w.Write(mdirBuffer.Bytes())
+	if err != nil {
+		return err
+	}
+
+	//Close handler box
+	_, err = w.EndBox()
+	if err != nil {
+		return err
+	}
+
+	// Start tag atom
+	_, err = w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeIlst()})
+	if err != nil {
+		return err
+	}
+
+	ctx = mp4.Context{UnderIlstMeta: true}
+
+	if len(tags.CoversData) > 0 {
+		err := writeCovers(w, ctx, tags.CoversData)
+		if err != nil {
+			return err
+		}
+	}
+	if tags.TrackNumber > 0 {
+		trkn := make([]byte, 8)
+		binary.BigEndian.PutUint32(trkn, uint32(tags.TrackNumber))
+		if tags.TrackTotal > 0 {
+			binary.BigEndian.PutUint16(trkn[4:], uint16(tags.TrackTotal))
+		}
+		err = writeMeta(w, atomsMap["Track"], ctx, trkn)
+		if err != nil {
+			return err
+		}
+	}
+	if tags.ContentRating > 0 {
+		err = writeMeta(w, atomsMap["ContentRating"], ctx, []byte{byte(tags.ContentRating)})
+		if err != nil {
+			return err
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if tags.DiskNumber > 0 {
+		disk := make([]byte, 8)
+		binary.BigEndian.PutUint32(disk, uint32(tags.DiskNumber))
+		if tags.DiskTotal > 0 {
+			binary.BigEndian.PutUint16(disk[4:], uint16(tags.DiskTotal))
+		}
+		err = writeMeta(w, atomsMap["Disk"], ctx, disk)
+		if err != nil {
+			return err
+		}
+	}
+	for tagName, needCreate := range atoms {
+		if tagName == "Cover" || tagName == "Track" || tagName == "Disk" || tagName == "ContentRating" {
+			continue
+		}
+		var val string
+
+		switch tagName {
+		case "Year":
+			val = tags.yearStr
+		default:
+			val = reflect.ValueOf(*tags).FieldByName(tagName).String()
+		}
+		if !needCreate || val == "" {
+			continue
+		}
+		boxType := atomsMap[tagName]
+		err = writeMeta(w, boxType, ctx, val)
+		if err != nil {
+			return err
+		}
+	}
+	for field, value := range tags.Custom {
+		if value == "" {
+			continue
+		}
+		err = writeCustomMeta(w, ctx, field, strings.ToUpper(value))
+		if err != nil {
+			return err
+		}
+	}
+
+	// rewrite ilst size
+	_, err = w.EndBox()
+	if err != nil {
+		return err
+	}
+
+	//rewrite meta box size
+	_, err = w.EndBox()
+	if err != nil {
+		return err
+	}
+
+	// rewrite udta box size
+	_, err = w.EndBox()
+	if err != nil {
+		return err
+	}
+
+	// rewrite moov box size
+	_, err = w.EndBox()
+	if err != nil {
+		return err
+	}
+
+	// create free box
+	_, err = w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeFree()})
+
+	// Since header takes 8 bytes, make buffer 2040 giving the atom a total length of 2048 bytes
+	freeBuffer := bytes.Buffer{}
+	freeBuffer.Write(bytes.Repeat([]byte{0x00}, 2040))
+	_, err = w.Write(freeBuffer.Bytes())
+	if err != nil {
+		return err
+	}
+
+	// Rewrite free box size
+	_, err = w.EndBox()
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

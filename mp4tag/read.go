@@ -3,11 +3,10 @@ package mp4tag
 import (
 	"encoding/binary"
 	"errors"
-	"reflect"
-	"strconv"
-	"fmt"
 	"github.com/abema/go-mp4"
 	"github.com/sunfish-shogi/bufseekio"
+	"reflect"
+	"strconv"
 )
 
 var boxesList = []mp4.BoxType{
@@ -22,7 +21,7 @@ var boxesList = []mp4.BoxType{
 	{'\251', 'w', 'r', 't'},
 	{'c', 'o', 'v', 'r'},
 	{'\251', 'l', 'y', 'r'},
-	//{'r', 't', 'n', 'g'},
+	{'r', 't', 'n', 'g'},
 	{'\251', 'l', 'a', 'b'},
 }
 
@@ -38,9 +37,8 @@ var boxesMap = map[mp4.BoxType]string{
 	{'\251', 'w', 'r', 't'}: "Composer",
 	{'c', 'o', 'v', 'r'}:    "Cover",
 	{'\251', 'l', 'y', 'r'}: "UnsyncedLyrics",
-	{'\251', 'l', 'a', 'b'}: "Label",         
-	        
-	//{'r', 't', 'n', 'g'}:    "ItunesAdvisory",
+	{'\251', 'l', 'a', 'b'}: "Label",
+	{'r', 't', 'n', 'g'}:    "ContentRating",
 }
 
 func readValue(h *mp4.ReadHandle, customField bool) (string, error) {
@@ -105,7 +103,6 @@ func setValue(parsedTags *Tags, h *mp4.ReadHandle, currentKey string, isCustom b
 	return nil
 }
 
-
 func setTrack(parsedTags *Tags, h *mp4.ReadHandle) error {
 	trackNum, trackTotal, err := readTrack(h)
 	if err != nil {
@@ -116,24 +113,34 @@ func setTrack(parsedTags *Tags, h *mp4.ReadHandle) error {
 	return nil
 }
 
-// func setAdvisory(parsedTags *Tags, h *mp4.ReadHandle) error {
-// 	advisory, err := readInt(h)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	parsedTags.ItunesAdvisory = advisory
-// 	return nil
-// }
+func setContentRating(parsedTags *Tags, h *mp4.ReadHandle) error {
+	advisory, err := readInt(h)
+	if err != nil {
+		return err
+	}
+
+	if !(advisory > 0 && advisory <= 2) {
+		return errors.New("invalid value for content rating:" + strconv.Itoa(advisory))
+	}
+
+	// Content Rating
+	// 0 = Unrated
+	// 1 = Explicit
+	// 2 = Clean
+
+	parsedTags.ContentRating = advisory
+	return nil
+}
 
 func setYear(parsedTags *Tags, h *mp4.ReadHandle) error {
 	year, err := readInt(h)
 	if err != nil {
 		return err
 	}
+
 	parsedTags.Year = year
 	return nil
 }
-
 
 func contains(boxType mp4.BoxType) mp4.BoxType {
 	for _, _boxType := range boxesList {
@@ -146,7 +153,7 @@ func contains(boxType mp4.BoxType) mp4.BoxType {
 
 func (mp4File *MP4File) actualRead() (*Tags, error) {
 	var (
-		err error
+		err        error
 		currentKey string
 		isCustom   bool
 	)
@@ -182,12 +189,12 @@ func (mp4File *MP4File) actualRead() (*Tags, error) {
 				err = setTrack(parsedTags, h)
 				if err != nil {
 					return nil, err
-				}				
-			// case "ItunesAdvisory":
-			// 	err = setAdvisory(parsedTags, h)
-			// 	if err != nil {
-			// 		return nil, err
-			// 	}
+				}
+			case "ContentRating":
+				err = setContentRating(parsedTags, h)
+				if err != nil {
+					return nil, err
+				}
 			case "Year":
 				err = setYear(parsedTags, h)
 				if err != nil {
@@ -199,7 +206,10 @@ func (mp4File *MP4File) actualRead() (*Tags, error) {
 					return nil, err
 				}
 			default:
-				setValue(parsedTags, h, currentKey, isCustom)
+				err := setValue(parsedTags, h, currentKey, isCustom)
+				if err != nil {
+					return nil, err
+				}
 				isCustom = false
 				if err != nil {
 					return nil, err

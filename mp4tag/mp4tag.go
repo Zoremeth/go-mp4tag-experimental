@@ -2,12 +2,12 @@ package mp4tag
 
 import (
 	"os"
-	"fmt"
 	"strconv"
+	"strings"
 )
 
 func (mp4File *MP4File) Close() error {
-	fmt.Println("close")
+	//fmt.Println("close")
 	return mp4File.f.Close()
 }
 
@@ -16,6 +16,14 @@ func (mp4File *MP4File) Read() (*Tags, error) {
 }
 
 func (mp4File *MP4File) Write(tags *Tags) error {
+	if tags.ContentRatingStr != "" {
+		switch strings.ToLower(tags.ContentRatingStr) {
+		case "explicit":
+			tags.ContentRating = 1
+		case "clean":
+			tags.ContentRating = 2
+		}
+	}
 	if tags.Year > 0 {
 		tags.yearStr = strconv.Itoa(tags.Year)
 	}
@@ -41,7 +49,7 @@ func Open(trackPath string) (*MP4File, error) {
 	// 	return err
 	// }
 	mp4File := &MP4File{
-		f: outFile,
+		f:         outFile,
 		trackPath: trackPath,
 	}
 	return mp4File, nil
